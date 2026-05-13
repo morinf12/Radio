@@ -69,18 +69,24 @@ CtrlEvent controls_poll() {
   CtrlEvent inj = injectPop();
   if (inj != CTRL_NONE) return inj;
 
-  // Held button: handle auto-repeat or release.
+  // Held button: handle auto-repeat or release. Auto-repeat is only enabled
+  // for UP / DOWN (volume); LEFT / RIGHT (prev/next station), A and B fire
+  // exactly once per press to avoid skipping past several stations.
   if (s_heldIdx >= 0) {
     if (digitalRead(s_pins[s_heldIdx]) == LOW) {
-      if (!s_repeating) {
-        if (now - s_pressTime >= REPEAT_DELAY_MS) {
-          s_repeating  = true;
+      CtrlEvent ev = s_events[s_heldIdx];
+      bool canRepeat = (ev == CTRL_ROT_CW) || (ev == CTRL_ROT_CCW);
+      if (canRepeat) {
+        if (!s_repeating) {
+          if (now - s_pressTime >= REPEAT_DELAY_MS) {
+            s_repeating  = true;
+            s_lastRepeat = now;
+            return ev;
+          }
+        } else if (now - s_lastRepeat >= REPEAT_RATE_MS) {
           s_lastRepeat = now;
-          return s_events[s_heldIdx];
+          return ev;
         }
-      } else if (now - s_lastRepeat >= REPEAT_RATE_MS) {
-        s_lastRepeat = now;
-        return s_events[s_heldIdx];
       }
       return CTRL_NONE;
     }

@@ -3,6 +3,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
+#include <esp_heap_caps.h>
 
 #ifndef FW_VERSION
 #define FW_VERSION "dev"
@@ -12,6 +13,33 @@
 // can pick GPIO 11/12 for MOSI/SCLK (same wiring as the horloge project).
 static SPIClass s_spi(FSPI);
 static Adafruit_ST7789 s_tft(&s_spi, TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN);
+
+// ---------------- Off-screen framebuffer (PSRAM) -----------------------------
+// All drawing happens in a 16-bit canvas that lives in PSRAM, then the full
+// frame is pushed to the panel in a single SPI transaction. This removes the
+// flicker / tearing you'd otherwise see while individual rectangles and text
+// glyphs are drawn one by one directly on the TFT.
+//
+// 280 * 240 * 2 = 134 400 bytes -> easily fits in the 2 MB PSRAM of the
+// Wemos S2 Mini.
+class PSCanvas16 : public GFXcanvas16 {
+public:
+  PSCanvas16(uint16_t w, uint16_t h)
+    : GFXcanvas16(w, h, /*allocate_buffer=*/false) {
+    size_t bytes = (size_t)w * (size_t)h * 2;
+    buffer = (uint16_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (!buffer) {
+      // Fallback to internal RAM if PSRAM allocation fails (e.g. when run on
+      // a board without PSRAM). Drawing still works.
+      buffer = (uint16_t*)malloc(bytes);
+    }
+    if (buffer) memset(buffer, 0, bytes);
+    buffer_owned = false;   // long-lived, never destroyed
+  }
+};
+
+static PSCanvas16* s_canvas = nullptr;
+#define g (*s_canvas)            // drawing target: canvas in PSRAM
 
 static String  s_station = "";
 static int     s_idx = 0, s_total = 0;
@@ -52,6 +80,17 @@ static void applyBacklight() {
 #endif
 }
 
+// Push the PSRAM canvas to the panel as a single bitmap blit. Adafruit_SPITFT
+// turns this into one setAddrWindow() + a streamed writePixels(), so there is
+// no visible "drawing in progress" flicker on the screen.
+static void flush() {
+  if (!s_canvas || !s_canvas->getBuffer()) return;
+  s_tft.startWrite();
+  s_tft.setAddrWindow(0, 0, TFT_WIDTH, TFT_HEIGHT);
+  s_tft.writePixels(s_canvas->getBuffer(), (uint32_t)TFT_WIDTH * TFT_HEIGHT);
+  s_tft.endWrite();
+}
+
 void display_begin() {
   // Bind FSPI to the actual TFT wiring before initialising the panel.
   s_spi.begin(TFT_SCLK_PIN, -1, TFT_MOSI_PIN, TFT_CS_PIN);
@@ -71,53 +110,61 @@ void display_begin() {
   s_tft.setRotation(TFT_ROTATION);
   s_tft.fillScreen(COL_BG);
 
+  // Off-screen framebuffer in PSRAM. The canvas itself has no rotation set;
+  // it is laid out in the same orientation the panel uses after setRotation(),
+  // so its (0,0) maps directly to the TFT's (0,0).
+  if (!s_canvas) s_canvas = new PSCanvas16(TFT_WIDTH, TFT_HEIGHT);
+  g.fillScreen(COL_BG);
+
   applyBacklight();
   display_forceRedraw();
 }
 
 // ---------------- Splash screen ---------------------------------------------
 void display_showBoot(const char* hostname) {
-  s_tft.fillScreen(COL_BG);
-  s_tft.setTextWrap(false);
+  g.fillScreen(COL_BG);
+  g.setTextWrap(false);
 
   // Title
-  s_tft.setTextColor(COL_ACCENT);
-  s_tft.setTextSize(4);
+  g.setTextColor(COL_ACCENT);
+  g.setTextSize(4);
   int16_t bx, by; uint16_t bw, bh;
-  s_tft.getTextBounds("Radio", 0, 0, &bx, &by, &bw, &bh);
-  s_tft.setCursor((TFT_WIDTH - (int16_t)bw) / 2, SAFE_Y + 30);
-  s_tft.print("Radio");
+  g.getTextBounds("Radio", 0, 0, &bx, &by, &bw, &bh);
+  g.setCursor((TFT_WIDTH - (int16_t)bw) / 2, SAFE_Y + 30);
+  g.print("Radio");
 
   // Hostname (centered)
   if (hostname && *hostname) {
-    s_tft.setTextColor(COL_FG);
-    s_tft.setTextSize(2);
-    s_tft.getTextBounds(hostname, 0, 0, &bx, &by, &bw, &bh);
-    s_tft.setCursor((TFT_WIDTH - (int16_t)bw) / 2, SAFE_Y + 90);
-    s_tft.print(hostname);
+    g.setTextColor(COL_FG);
+    g.setTextSize(2);
+    g.getTextBounds(hostname, 0, 0, &bx, &by, &bw, &bh);
+    g.setCursor((TFT_WIDTH - (int16_t)bw) / 2, SAFE_Y + 90);
+    g.print(hostname);
   }
 
   // Firmware version (small, bottom)
-  s_tft.setTextColor(COL_MUTED);
-  s_tft.setTextSize(1);
+  g.setTextColor(COL_MUTED);
+  g.setTextSize(1);
   const char* ver = FW_VERSION;
-  s_tft.getTextBounds(ver, 0, 0, &bx, &by, &bw, &bh);
-  s_tft.setCursor((TFT_WIDTH - (int16_t)bw) / 2, SAFE_Y + SAFE_H - 12);
-  s_tft.print(ver);
+  g.getTextBounds(ver, 0, 0, &bx, &by, &bw, &bh);
+  g.setCursor((TFT_WIDTH - (int16_t)bw) / 2, SAFE_Y + SAFE_H - 12);
+  g.print(ver);
 
+  flush();
   // Mark the main UI dirty so it repaints fully when we leave the splash.
   s_dirty = true;
 }
 
 void display_showIP(const char* ip) {
   if (!ip || !*ip) return;
-  s_tft.fillRect(SAFE_X, 140, SAFE_W, 30, COL_BG);
-  s_tft.setTextColor(COL_OK);
-  s_tft.setTextSize(2);
+  g.fillRect(SAFE_X, 140, SAFE_W, 30, COL_BG);
+  g.setTextColor(COL_OK);
+  g.setTextSize(2);
   int16_t bx, by; uint16_t bw, bh;
-  s_tft.getTextBounds(ip, 0, 0, &bx, &by, &bw, &bh);
-  s_tft.setCursor((TFT_WIDTH - (int16_t)bw) / 2, 145);
-  s_tft.print(ip);
+  g.getTextBounds(ip, 0, 0, &bx, &by, &bw, &bh);
+  g.setCursor((TFT_WIDTH - (int16_t)bw) / 2, 145);
+  g.print(ip);
+  flush();
   s_dirty = true;
 }
 
@@ -152,18 +199,17 @@ uint8_t display_getBacklight() { return s_backlight; }
 void    display_forceRedraw()  { s_dirty = true; }
 
 static void drawHeader() {
-  // Stay inside the rounded-corner safe area.
-  s_tft.fillRoundRect(SAFE_X, SAFE_Y, SAFE_W, 32, 6, COL_ACCENT);
-  s_tft.setTextColor(0xFFFF);
-  s_tft.setTextSize(2);
-  s_tft.setCursor(SAFE_X + 23, SAFE_Y + 8);
-  s_tft.print("Radio");
+  g.fillRoundRect(SAFE_X, SAFE_Y, SAFE_W, 32, 6, COL_ACCENT);
+  g.setTextColor(0xFFFF);
+  g.setTextSize(2);
+  g.setCursor(SAFE_X + 23, SAFE_Y + 8);
+  g.print("Radio");
   // Wi-Fi indicator (right side)
-  s_tft.setTextSize(1);
-  s_tft.setCursor(SAFE_X + SAFE_W - 70, SAFE_Y + 4);
-  s_tft.print(s_wifiOk ? "WiFi OK" : "AP mode");
-  s_tft.setCursor(SAFE_X + SAFE_W - 70, SAFE_Y + 16);
-  s_tft.print(s_wifi.substring(0, 10));
+  g.setTextSize(1);
+  g.setCursor(SAFE_X + SAFE_W - 70, SAFE_Y + 4);
+  g.print(s_wifiOk ? "WiFi OK" : "AP mode");
+  g.setCursor(SAFE_X + SAFE_W - 70, SAFE_Y + 16);
+  g.print(s_wifi.substring(0, 10));
 }
 
 static void drawStationCard() {
@@ -171,93 +217,99 @@ static void drawStationCard() {
   int y = SAFE_Y + 36;
   int w = SAFE_W;
   const int h = 76;
-  s_tft.fillRoundRect(x, y, w, h, 8, COL_CARD);
-  s_tft.drawRoundRect(x, y, w, h, 8, 0x2186);
+  g.fillRoundRect(x, y, w, h, 8, COL_CARD);
+  g.drawRoundRect(x, y, w, h, 8, 0x2186);
 
-  s_tft.setTextColor(COL_MUTED);
-  s_tft.setTextSize(1);
-  s_tft.setCursor(x + 8, y + 6);
+  g.setTextColor(COL_MUTED);
+  g.setTextSize(1);
+  g.setCursor(x + 8, y + 6);
   char buf[24];
   snprintf(buf, sizeof(buf), "STATION  %d / %d", s_idx + 1, s_total);
-  s_tft.print(buf);
+  g.print(buf);
 
   // Station name (large, centered)
-  s_tft.setTextColor(COL_FG);
-  s_tft.setTextSize(2);
+  g.setTextColor(COL_FG);
+  g.setTextSize(2);
   int16_t bx, by; uint16_t bw, bh;
-  s_tft.getTextBounds(s_station, 0, 0, &bx, &by, &bw, &bh);
+  g.getTextBounds(s_station, 0, 0, &bx, &by, &bw, &bh);
   int16_t cx = x + (w - (int16_t)bw) / 2;
   if (cx < x + 8) cx = x + 8;
-  s_tft.setCursor(cx, y + 22);
-  s_tft.print(s_station);
+  g.setCursor(cx, y + 22);
+  g.print(s_station);
 
   // Status line
-  s_tft.setTextColor(s_status.startsWith("Erreur") ? COL_ERR : COL_OK);
-  s_tft.setTextSize(1);
-  s_tft.getTextBounds(s_status, 0, 0, &bx, &by, &bw, &bh);
+  g.setTextColor(s_status.startsWith("Erreur") ? COL_ERR : COL_OK);
+  g.setTextSize(1);
+  g.getTextBounds(s_status, 0, 0, &bx, &by, &bw, &bh);
   cx = x + (w - (int16_t)bw) / 2; if (cx < x + 8) cx = x + 8;
-  s_tft.setCursor(cx, y + h - 12);
-  s_tft.print(s_status);
+  g.setCursor(cx, y + h - 12);
+  g.print(s_status);
 }
 
 static void drawTitleArea() {
-  s_tft.fillRect(SAFE_X, TITLE_AREA_Y, SAFE_W, TITLE_AREA_H, COL_BG);
-  s_tft.setTextSize(2);
-  s_tft.setTextColor(COL_MUTED);
+  g.fillRect(SAFE_X, TITLE_AREA_Y, SAFE_W, TITLE_AREA_H, COL_BG);
+  g.setTextSize(2);
+  g.setTextColor(COL_MUTED);
 
   String t = s_title.length() ? s_title : String("(en attente du titre)");
 
   int16_t bx, by; uint16_t bw, bh;
-  s_tft.getTextBounds(t, 0, 0, &bx, &by, &bw, &bh);
+  g.getTextBounds(t, 0, 0, &bx, &by, &bw, &bh);
   int x;
   if ((int)bw <= SAFE_W) {
     x = SAFE_X + (SAFE_W - (int16_t)bw) / 2;
-    s_tft.setCursor(x, TITLE_AREA_Y + 8);
-    s_tft.print(t);
+    g.setCursor(x, TITLE_AREA_Y + 8);
+    g.print(t);
   } else {
     int total = (int)bw + 30;
     int off = s_titleScroll % total;
-    s_tft.setCursor(SAFE_X - off, TITLE_AREA_Y + 8);
-    s_tft.print(t);
-    s_tft.setCursor(SAFE_X - off + total, TITLE_AREA_Y + 8);
-    s_tft.print(t);
+    g.setCursor(SAFE_X - off, TITLE_AREA_Y + 8);
+    g.print(t);
+    g.setCursor(SAFE_X - off + total, TITLE_AREA_Y + 8);
+    g.print(t);
   }
 }
 
 static void drawVolume() {
   int y = 172;
-  s_tft.fillRect(SAFE_X, y, SAFE_W, (SAFE_Y + SAFE_H) - y, COL_BG);
-  s_tft.setTextColor(COL_MUTED);
-  s_tft.setTextSize(1);
-  s_tft.setCursor(SAFE_X, y);
-  s_tft.print(s_muted ? "VOLUME (MUET)" : "VOLUME");
+  g.fillRect(SAFE_X, y, SAFE_W, (SAFE_Y + SAFE_H) - y, COL_BG);
+  g.setTextColor(COL_MUTED);
+  g.setTextSize(1);
+  g.setCursor(SAFE_X, y);
+  g.print(s_muted ? "VOLUME (MUET)" : "VOLUME");
 
   int barX = SAFE_X, barY = y + 12, barW = SAFE_W, barH = 14;
-  s_tft.drawRoundRect(barX, barY, barW, barH, 4, COL_MUTED);
+  g.drawRoundRect(barX, barY, barW, barH, 4, COL_MUTED);
   int fw = (int)((long)(barW - 4) * s_vol / s_volMax);
   uint16_t fill = s_muted ? COL_ERR : COL_OK;
-  s_tft.fillRoundRect(barX + 2, barY + 2, fw, barH - 4, 3, fill);
+  g.fillRoundRect(barX + 2, barY + 2, fw, barH - 4, 3, fill);
 
   char buf[8];
   snprintf(buf, sizeof(buf), "%u/%u", s_vol, s_volMax);
-  s_tft.setTextColor(COL_FG);
-  s_tft.setCursor(barX, barY + barH + 3);
-  s_tft.print(buf);
+  g.setTextColor(COL_FG);
+  g.setCursor(barX, barY + barH + 3);
+  g.print(buf);
 }
 
 void display_loop() {
   uint32_t now = millis();
-  // Scrolling title (50 ms)
+  // Scrolling title (50 ms). The full frame is recomposed and pushed in one
+  // go below, so the title-scroll path also needs a flush.
+  bool needFlush = false;
   if (s_title.length() && now - s_lastScroll >= 50) {
     s_lastScroll = now;
     s_titleScroll += 2;
     drawTitleArea();
+    needFlush = true;
   }
-  if (!s_dirty) return;
-  s_dirty = false;
-  s_tft.fillScreen(COL_BG);
-  drawHeader();
-  drawStationCard();
-  drawTitleArea();
-  drawVolume();
+  if (s_dirty) {
+    s_dirty = false;
+    g.fillScreen(COL_BG);
+    drawHeader();
+    drawStationCard();
+    drawTitleArea();
+    drawVolume();
+    needFlush = true;
+  }
+  if (needFlush) flush();
 }

@@ -560,6 +560,11 @@ static const char OTA_HTML[] PROGMEM = R"HTML(
     <div id="curVer">...</div>
   </section>
   <section class="card">
+    <h2>V&eacute;rifier les mises &agrave; jour</h2>
+    <button class="primary" type="button" onclick="checkUpdate()">V&eacute;rifier sur GitHub</button>
+    <div id="updStatus" style="margin-top:10px;color:#9fb3d1;font-size:14px"></div>
+  </section>
+  <section class="card">
     <h2>T&eacute;l&eacute;verser le firmware</h2>
     <p style="color:#9fb3d1;font-size:13px">S&eacute;lectionnez un fichier <code>.bin</code> compil&eacute; et envoyez-le.</p>
     <form id="f" enctype="multipart/form-data" method="POST" action="/update">
@@ -577,9 +582,40 @@ document.getElementById('fw').addEventListener('change',function(){
   document.getElementById('fl').textContent = this.files[0] ? this.files[0].name : 'Choisir un fichier';
 });
 fetch('/api/version').then(r=>r.json()).then(d=>{
-  document.getElementById('curVer').innerHTML =
-    '<b>Build:</b> '+d.version+'<br><b>Release:</b> '+d.release;
+  const el = document.getElementById('curVer');
+  el.innerHTML = '<b>Build:</b> '+d.version+'<br><b>Release:</b> '+(d.release||'?');
+  el.dataset.release = d.release || '';
+  el.dataset.build   = d.version || '';
 });
+function checkUpdate(){
+  const s = document.getElementById('updStatus');
+  s.innerHTML = 'V\u00e9rification...';
+  s.style.color = '#9fb3d1';
+  const el = document.getElementById('curVer');
+  const curRelease = el.dataset.release || '';
+  const curBuild   = el.dataset.build   || '';
+  fetch('https://api.github.com/repos/morinf12/Radio/releases/latest')
+  .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+  .then(d=>{
+    const tag = d.tag_name || '?';
+    const isUpToDate = (curRelease === tag);
+    s.innerHTML = '<b>Install\u00e9:</b> '+curRelease+' ('+curBuild+')<br><b>Disponible:</b> '+tag;
+    if (isUpToDate) {
+      s.innerHTML += '<br><span style="color:#7ee787;font-size:16px">&#x2714; Votre firmware est \u00e0 jour</span>';
+      s.style.color = '#7ee787';
+    } else {
+      s.innerHTML += '<br><span style="color:#f0883e;font-size:16px;font-weight:bold">&#x26A0; Une nouvelle version est disponible!</span>';
+      s.innerHTML += '<br><a href="'+d.html_url+'" target="_blank" style="color:#58a6ff">Notes de version</a>';
+      s.style.color = '#d29922';
+      const bin = d.assets && d.assets.find(a=>a.name.endsWith('.bin'));
+      if (bin) {
+        s.innerHTML += '<br><a href="'+bin.browser_download_url+'" style="display:inline-block;margin-top:8px;padding:10px 16px;background:#238636;color:white;border-radius:6px;text-decoration:none;font-weight:bold">&#x2B07; T\u00e9l\u00e9charger '+tag+'</a>';
+        s.innerHTML += '<br><small style="color:#9fb3d1">Puis utilisez le formulaire ci-dessous pour l\'envoyer</small>';
+      }
+    }
+  })
+  .catch(e=>{ s.textContent = 'Erreur: '+e.name+': '+e.message; s.style.color = '#f85149'; });
+}
 const f=document.getElementById('f'),p=document.getElementById('p'),l=document.getElementById('log');
 f.addEventListener('submit',e=>{
   e.preventDefault();
