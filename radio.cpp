@@ -19,10 +19,14 @@ static void playCurrent() {
   if (idx < 0 || idx >= stations_count()) return;
   const Station& st = stations_get(idx);
   display_setStation(st.name, idx, stations_count());
-  display_setStatus("Connexion...");
   display_setStreamTitle("");
-  audio_play(st.url);
-  display_setStatus(audio_isPlaying() ? "En cours" : "Erreur de connexion");
+  // connecttohost() is async: a 'true' here only means the HTTP request was
+  // dispatched. Actual playback starts a few audio_loop() iterations later,
+  // so we mark the UI as "Connexion..." and let loop() promote to
+  // "En cours" once isRunning() becomes true (or back to an error after a
+  // timeout if it never does).
+  bool ok = audio_play(st.url);
+  display_setStatus(ok ? "Connexion..." : "Erreur de connexion");
 }
 
 static void changeStation(int delta) {
@@ -49,8 +53,18 @@ void setup() {
   }
   display_begin();
   display_setBacklight(bl);
-  display_setStatus("Demarrage...");
-  display_setStation("Radio", 0, 0);
+
+  // Splash screen (hostname is what the web UI publishes via mDNS / DHCP).
+  String hostname;
+  {
+    Preferences p;
+    if (p.begin("wifi", true)) {
+      hostname = p.getString("hostname", "radio");
+      p.end();
+    }
+    if (hostname.length() == 0) hostname = "radio";
+  }
+  display_showBoot(hostname.c_str());
 
   controls_begin();
   stations_begin();
@@ -60,6 +74,14 @@ void setup() {
   // Wi-Fi + web server (also handles captive-portal AP fallback)
   webui_begin();
   display_setWifi(!webui_isApMode(), webui_currentSsidOrIp());
+
+  // Show IP on the splash screen for a couple of seconds before switching to
+  // the playback UI.
+  display_showIP(webui_currentSsidOrIp().c_str());
+  delay(2000);
+
+  display_setStatus("Demarrage...");
+  display_setStation("Radio", 0, 0);
 
   if (!webui_isApMode() && stations_count() > 0) {
     playCurrent();
@@ -103,6 +125,29 @@ void loop() {
   static String s_lastTitle;
   const String& t = audio_streamTitle();
   if (t != s_lastTitle) { s_lastTitle = t; display_setStreamTitle(t); }
+
+  // Promote status from "Connexion..." to "En cours" once the audio library
+  // has actually started decoding, or to an error after a reasonable timeout.
+  static bool     s_wasPlaying = false;
+  static uint32_t s_connectStart = 0;
+  bool playing = audio_isPlaying();
+  if (playing != s_wasPlaying) {
+    s_wasPlaying = playing;
+    if (playing) {
+      display_setStatus("En cours");
+      s_connectStart = 0;
+    } else {
+      // Stream stopped (EOF / disconnect). Note start of new connect attempt.
+      s_connectStart = millis();
+      display_setStatus(audio_currentUrl().length() ? "Connexion..." : "Arrete");
+    }
+  } else if (!playing && audio_currentUrl().length()) {
+    if (s_connectStart == 0) s_connectStart = millis();
+    if (millis() - s_connectStart > 10000) {
+      display_setStatus("Erreur de connexion");
+      s_connectStart = 0;
+    }
+  }
 
   // Wi-Fi status update (cheap; once a second)
   static uint32_t s_lastWifi = 0;

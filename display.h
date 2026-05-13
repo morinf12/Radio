@@ -4,6 +4,10 @@
 void   display_begin();
 void   display_loop();                 // periodic redraws (scrolling title etc.)
 
+// Splash screen helpers (shown during setup, replaced once playback starts)
+void   display_showBoot(const char* hostname);
+void   display_showIP(const char* ip);
+
 void   display_setStation(const String& name, int index, int total);
 void   display_setStreamTitle(const String& title);
 void   display_setVolume(uint8_t v, uint8_t maxV, bool muted);

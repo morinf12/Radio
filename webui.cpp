@@ -3,6 +3,7 @@
 #include "stations.h"
 #include "audio_player.h"
 #include "display.h"
+#include "controls.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
@@ -80,7 +81,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 </style>
 </head>
 <body>
-<header>Radio <a href="/wifi">Wi-Fi</a> <a href="/update">OTA</a></header>
+<header>Radio <a href="/wifi">Wi-Fi</a> <a href="/update">OTA</a> <a href="/debug">Debug</a></header>
 <main>
 
   <section class="card">
@@ -373,6 +374,151 @@ fetch('/api/wifi/hostname').then(r=>r.json()).then(d=>{ document.getElementById(
 </html>
 )HTML";
 
+// ---------------- Debug page (simulate front buttons) ------------------------
+static const char DEBUG_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Radio - Debug</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif;
+         background: #0e1726; color: #e6edf3; }
+  header { background: #1f6feb; padding: 14px 18px; font-size: 20px; font-weight: 600; }
+  header a { color: white; text-decoration: none; margin-left: 16px; font-size: 14px; opacity: 0.85; }
+  main { max-width: 520px; margin: 0 auto; padding: 16px; }
+  .card { background: #161f33; border: 1px solid #243049; border-radius: 10px;
+          padding: 16px; margin-bottom: 14px; }
+  h2 { margin: 0 0 12px; font-size: 16px; color: #9fb3d1; text-transform: uppercase; letter-spacing: 1px; }
+
+  .now { text-align:center; padding:6px 0; }
+  .now .name  { font-size:22px; font-weight:700; }
+  .now .title { font-size:13px; color:#7ee787; min-height:18px; margin-top:6px;
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .meta { display:flex; justify-content:space-around; margin-top:10px;
+          font-size:13px; color:#9fb3d1; }
+  .meta b { color:#e6edf3; }
+
+  .pad { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr 1fr;
+         grid-template-rows: auto auto auto; gap: 8px; }
+  .btn { padding: 14px 0; border-radius: 10px; border: 2px solid #2c3a5a;
+         background: #1a2540; color: #e6edf3; font-size: 16px; font-weight: 700;
+         cursor: pointer; text-align: center; user-select: none;
+         transition: background 0.1s; }
+  .btn:active, .btn.pressed { background: #1f6feb; border-color: #1f6feb; }
+  .btn-up    { grid-column: 2; grid-row: 1; }
+  .btn-down  { grid-column: 2; grid-row: 3; }
+  .btn-left  { grid-column: 1; grid-row: 2; }
+  .btn-right { grid-column: 3; grid-row: 2; }
+  .btn-a     { grid-column: 5; grid-row: 1; background: #0d3b1e; border-color: #1a6b35; }
+  .btn-b     { grid-column: 6; grid-row: 1; background: #3b0d0d; border-color: #6b1a1a; }
+  .btn-a:active { background: #1a6b35; }
+  .btn-b:active { background: #6b1a1a; }
+  .hint { font-size:12px; color:#7280a0; margin-top:10px; line-height:1.6; }
+  .hint code { background:#0e1726; padding:1px 6px; border-radius:4px; color:#e6edf3; }
+  .status { font-size: 12px; color: #7280a0; text-align: center; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>Radio - Debug <a href="/">Accueil</a> <a href="/wifi">Wi-Fi</a> <a href="/update">OTA</a></header>
+<main>
+
+<section class="card">
+  <h2>Etat</h2>
+  <div class="now">
+    <div class="name"  id="curName">-</div>
+    <div class="title" id="curTitle">-</div>
+  </div>
+  <div class="meta">
+    <div>Vol: <b id="mVol">-</b></div>
+    <div>Mute: <b id="mMute">-</b></div>
+    <div>Lecture: <b id="mPlay">-</b></div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Boutons</h2>
+  <div class="pad" id="pad">
+    <div class="btn btn-up"    data-btn="up">&#9650; UP</div>
+    <div class="btn btn-left"  data-btn="left">&#9664; L</div>
+    <div class="btn btn-right" data-btn="right">R &#9654;</div>
+    <div class="btn btn-down"  data-btn="down">&#9660; DN</div>
+    <div class="btn btn-a"     data-btn="a">A</div>
+    <div class="btn btn-b"     data-btn="b">B</div>
+  </div>
+  <div class="hint">
+    UP/DOWN : volume &nbsp; LEFT/RIGHT : station prec./suiv.<br>
+    A : lecture / pause &nbsp; B : reserve<br>
+    Clavier : <code>&#8593;&#8595;&#8592;&#8594;</code>, <code>A</code>, <code>B</code>
+  </div>
+  <div class="status" id="status">Pret</div>
+</section>
+
+</main>
+<script>
+function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
+
+async function refresh(){
+  try{
+    const r = await fetch('/api/now');
+    const s = await r.json();
+    document.getElementById('curName').textContent  = s.name  || '-';
+    document.getElementById('curTitle').textContent = s.title || '-';
+    document.getElementById('mVol').textContent  = s.vol;
+    document.getElementById('mMute').textContent = s.muted ? 'oui' : 'non';
+    document.getElementById('mPlay').textContent = s.playing ? 'oui' : 'non';
+  }catch(e){}
+}
+
+let lastPress = 0;
+const COOLDOWN = 120;
+
+async function press(btn){
+  const now = Date.now();
+  if (now - lastPress < COOLDOWN) return;
+  lastPress = now;
+  document.getElementById('status').textContent = 'Envoi: ' + btn.toUpperCase();
+  // Flash the button visually.
+  const el = document.querySelector('[data-btn="'+btn+'"]');
+  if (el) { el.classList.add('pressed'); setTimeout(()=>el.classList.remove('pressed'), 120); }
+  try{
+    const fd = new URLSearchParams();
+    fd.append('btn', btn);
+    await fetch('/api/debug/press', { method:'POST', body: fd });
+    document.getElementById('status').textContent = 'OK: ' + btn.toUpperCase();
+    setTimeout(refresh, 80);
+  }catch(e){
+    document.getElementById('status').textContent = 'Erreur';
+  }
+}
+
+const pad = document.getElementById('pad');
+pad.addEventListener('touchstart', function(e){
+  const b = e.target.closest('[data-btn]');
+  if (b) { e.preventDefault(); press(b.dataset.btn); }
+}, {passive:false});
+pad.addEventListener('mousedown', function(e){
+  const b = e.target.closest('[data-btn]');
+  if (b) press(b.dataset.btn);
+});
+
+document.addEventListener('keydown', function(e){
+  const map = { ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right',
+                a:'a', A:'a', Enter:'a', b:'b', B:'b', Escape:'b' };
+  const btn = map[e.key];
+  if (btn) { e.preventDefault(); press(btn); }
+});
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
+)HTML";
+
 // ---------------- OTA page --------------------------------------------------
 static const char OTA_HTML[] PROGMEM = R"HTML(
 <!doctype html>
@@ -470,6 +616,21 @@ static String jsonEscape(const String& s) {
 static void hRoot()    { s_server.send_P(200, "text/html", INDEX_HTML); }
 static void hWifiPage(){ s_server.send_P(200, "text/html", WIFI_HTML); }
 static void hOtaPage() { s_server.send_P(200, "text/html", OTA_HTML); }
+static void hDebugPage(){ s_server.send_P(200, "text/html", DEBUG_HTML); }
+
+static void hDebugPress() {
+  if (!s_server.hasArg("btn")) { s_server.send(400, "text/plain", "missing btn"); return; }
+  String b = s_server.arg("btn");
+  CtrlEvent ev = CTRL_NONE;
+  if      (b == "up")    ev = CTRL_ROT_CW;
+  else if (b == "down")  ev = CTRL_ROT_CCW;
+  else if (b == "left")  ev = CTRL_PREV;
+  else if (b == "right") ev = CTRL_NEXT;
+  else if (b == "a")     ev = CTRL_ENC_PRESS;
+  else if (b == "b")     ev = CTRL_ENC_LONG;
+  if (ev != CTRL_NONE) controls_inject(ev);
+  s_server.send(200, "application/json", "{\"ok\":true}");
+}
 
 static void hVersion() {
   char buf[160];
@@ -499,10 +660,11 @@ static void playIndex(int idx) {
   stations_setCurrentIndex(idx);
   const Station& st = stations_get(idx);
   display_setStation(st.name, idx, stations_count());
-  display_setStatus("Connexion...");
   display_setStreamTitle("");
-  audio_play(st.url);
-  display_setStatus(audio_isPlaying() ? "En cours" : "Erreur de connexion");
+  // connecttohost() is async; status is promoted by radio.cpp loop() once
+  // playback actually starts.
+  bool ok = audio_play(st.url);
+  display_setStatus(ok ? "Connexion..." : "Erreur de connexion");
 }
 
 static void hPlay() {
@@ -723,7 +885,8 @@ void webui_begin() {
   s_server.on("/wifi",    hWifiPage);
   s_server.on("/update",  HTTP_GET, hOtaPage);
   s_server.on("/update",  HTTP_POST, hOtaResult, hOtaUpload);
-
+  s_server.on("/debug",   HTTP_GET, hDebugPage);
+  s_server.on("/api/debug/press", HTTP_POST, hDebugPress);
   s_server.on("/api/version",         hVersion);
   s_server.on("/api/now",             hNow);
   s_server.on("/api/play",            hPlay);

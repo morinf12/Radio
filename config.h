@@ -16,9 +16,9 @@
 #define TFT_CS_PIN      5   // CS
 #define TFT_BL_PIN      3   // BLK (backlight, PWM)
 
-#define TFT_WIDTH     240
-#define TFT_HEIGHT    280
-#define TFT_ROTATION    0   // portrait (240 wide x 280 tall)
+#define TFT_WIDTH     280   // logical width  (after rotation)
+#define TFT_HEIGHT    240   // logical height (after rotation)
+#define TFT_ROTATION    3   // landscape, rotated 90 deg counter-clockwise (USB at top)
 
 // ---------------- PCM5102 I2S DAC --------------------------------------------
 //   VIN -> 3.3V or 5V    GND -> GND
@@ -31,16 +31,20 @@
 #define I2S_LRC_PIN    17
 #define I2S_DOUT_PIN   18
 
-// ---------------- Rotary encoder (KY-040) + push -----------------------------
-//   GND -> GND   + -> 3.3V
-//   CLK -> ENC_A   DT -> ENC_B   SW -> ENC_SW (active LOW, internal pull-up)
-#define ENC_A_PIN      33
-#define ENC_B_PIN      34
-#define ENC_SW_PIN     35
-
-// ---------------- Front buttons (active LOW, internal pull-up) ---------------
-#define BTN_PREV_PIN   37   // station -1
-#define BTN_NEXT_PIN   38   // station +1
+// ---------------- Navigation buttons (active LOW, internal pull-up) ----------
+// Same pinout as the "horloge" project (Up/Down/Left/Right/A/B).
+//   UP    -> volume up
+//   DOWN  -> volume down
+//   LEFT  -> previous station
+//   RIGHT -> next station
+//   A     -> play / pause (mute toggle)
+//   B     -> reserved (menu / long-press equivalent)
+#define BTN_UP_PIN      1
+#define BTN_DOWN_PIN    2
+#define BTN_LEFT_PIN    4
+#define BTN_RIGHT_PIN   6
+#define BTN_A_PIN       8
+#define BTN_B_PIN      10
 
 // ---------------- Wi-Fi AP (captive portal) ----------------------------------
 #define WIFI_AP_SSID   "Radio"
