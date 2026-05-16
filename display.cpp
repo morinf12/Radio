@@ -329,11 +329,12 @@ void display_loop() {
 #ifdef DISPLAY_DISABLED
   return;
 #endif
-  // While audio is actively streaming, freeze the TFT entirely. A full-frame
-  // blit takes ~27 ms over SPI at 40 MHz on the single-core S2 and starves
-  // the I2S DMA feeder, causing audible drop-outs. Any pending change is
-  // remembered in s_dirty and will be flushed the next time playback stops.
-  if (audio_isPlaying()) return;
+  // While audio is actively streaming, freeze the TFT entirely *only* when we
+  // would otherwise push a full-frame blit. A canvas blit takes ~27 ms over
+  // SPI at 40 MHz and starves the I2S DMA feeder, causing audible drop-outs.
+  // In direct-to-panel mode (no canvas) the per-element draws are short, so
+  // we let them through and just keep going.
+  if (s_canvas && s_canvas->getBuffer() && audio_isPlaying()) return;
 
   uint32_t now = millis();
   bool needFlush = false;
