@@ -57,23 +57,6 @@
 #define WIFI_AP_PASS   "radio1234"      // >= 8 chars
 #define WIFI_AP_CHAN    6
 
-// ---------------- Wi-Fi STA default credentials ------------------------------
-// Used at power-up when no SSID has been saved via the web UI yet.
-// Leave empty to skip the default and go straight to the captive-portal AP.
-// NOTE: these end up in plain text in the firmware binary - do not commit
-//       real credentials to a public repo.
-#define WIFI_DEFAULT_SSID  "default_1b"
-#define WIFI_DEFAULT_PASS  "***REMOVED***"           // empty = open network
-// If non-zero, skip the pre-connect scan and force the STA to connect on this
-// channel. Useful when the AP is hidden, the scan misses it, or you want to
-// shave a couple of seconds off boot. 0 = scan as usual.
-#define WIFI_DEFAULT_CHANNEL  6
-
-// Define WIFI_FORCE_DEFAULTS to ignore any SSID/password saved in NVS and
-// always use the WIFI_DEFAULT_* values above. Also prints the password in
-// clear text on the serial monitor at boot for debugging.
-#define WIFI_FORCE_DEFAULTS
-
 // ---------------- Audio defaults ---------------------------------------------
 #define DEFAULT_VOLUME       12         // 0..21 (audio library scale)
 #define MAX_VOLUME           21

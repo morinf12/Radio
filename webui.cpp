@@ -282,7 +282,10 @@ static const char WIFI_HTML[] PROGMEM = R"HTML(
     <h2>Connexion</h2>
     <input id="ssid" type="text" placeholder="SSID" autocomplete="off">
     <input id="pass" type="password" placeholder="Mot de passe (vide si ouvert)">
+    <input id="pickedBssid" type="hidden">
+    <input id="pickedCh"    type="hidden">
     <button onclick="save()">Enregistrer et connecter</button>
+    <div id="pickedLabel"><small></small></div>
     <div id="msg"></div>
   </section>
 
@@ -334,8 +337,15 @@ async function scan() {
     nets.forEach(n => {
       const li = document.createElement('li');
       if (n.enc) li.classList.add('lock');
-      li.innerHTML = `<span><b>${n.ssid||'(hidden)'}</b> <small>ch ${n.ch}</small></span><small>${n.rssi} dBm</small>`;
-      li.onclick = () => { document.getElementById('ssid').value = n.ssid; document.getElementById('pass').focus(); };
+      li.innerHTML = `<span><b>${n.ssid||'(hidden)'}</b> <small>ch ${n.ch} - ${n.bssid||''}</small></span><small>${n.rssi} dBm</small>`;
+      li.onclick = () => {
+        document.getElementById('ssid').value = n.ssid;
+        document.getElementById('pickedBssid').value = n.bssid||'';
+        document.getElementById('pickedCh').value    = n.ch||'';
+        document.getElementById('pickedLabel').textContent =
+          (n.bssid && n.ch) ? `\u00e9pingl\u00e9 sur ch ${n.ch} (${n.bssid})` : '';
+        document.getElementById('pass').focus();
+      };
       ul.appendChild(li);
     });
   } catch(e) { document.getElementById('list').innerHTML = '<li><small class="err">\u00e9chec du scan</small></li>'; }
@@ -347,6 +357,17 @@ async function save() {
   if (!ssid) { msg.innerHTML = '<span class="err">SSID requis</span>'; return; }
   msg.innerHTML = '<small>enregistrement et red\u00e9marrage en mode STA...</small>';
   const fd = new URLSearchParams(); fd.append('ssid', ssid); fd.append('pass', pass);
+  // If the user clicked a specific row in the scan list we also pin its
+  // BSSID/channel so the radio connects to THAT AP, not a co-named neighbour.
+  // Only send when the SSID still matches what was clicked, otherwise the
+  // user typed a different name manually and we let the firmware re-scan.
+  const pickedSsid = document.getElementById('ssid').value.trim();
+  const pBssid     = document.getElementById('pickedBssid').value;
+  const pCh        = document.getElementById('pickedCh').value;
+  if (pBssid && pCh && pickedSsid === ssid) {
+    fd.append('bssid', pBssid);
+    fd.append('ch', pCh);
+  }
   await fetch('/api/wifi/save', { method:'POST', body: fd });
   msg.innerHTML = '<span class="ok">Enregistr\u00e9. Red\u00e9marrage en cours.</span>';
 }
@@ -799,7 +820,12 @@ static void hWifiScan() {
   for (int i = 0; i < n; ++i) {
     if (WiFi.SSID(i).isEmpty()) continue;
     if (!first) j += ","; first = false;
+    uint8_t* b = WiFi.BSSID(i);
+    char bs[18];
+    snprintf(bs, sizeof(bs), "%02X:%02X:%02X:%02X:%02X:%02X",
+             b[0], b[1], b[2], b[3], b[4], b[5]);
     j += "{\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\",";
+    j += "\"bssid\":\""  + String(bs) + "\",";
     j += "\"rssi\":"    + String(WiFi.RSSI(i)) + ",";
     j += "\"ch\":"      + String(WiFi.channel(i)) + ",";
     j += "\"enc\":"     + String(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "false" : "true");
@@ -812,8 +838,35 @@ static void hWifiScan() {
 
 static void hWifiSave() {
   if (!s_server.hasArg("ssid")) { s_server.send(400, "text/plain", "missing ssid"); return; }
-  s_prefs.putString("ssid", s_server.arg("ssid"));
+  String ssid = s_server.arg("ssid");
+  s_prefs.putString("ssid", ssid);
   s_prefs.putString("pass", s_server.hasArg("pass") ? s_server.arg("pass") : String());
+  // If the UI sent a specific BSSID+channel (user picked a row in the scan
+  // list) - prime the fast-connect cache with it so the next boot connects
+  // to THAT AP, not whichever co-named one happens to be loudest.
+  bool primed = false;
+  if (s_server.hasArg("ch") && s_server.hasArg("bssid")) {
+    int    ch  = s_server.arg("ch").toInt();
+    String bs  = s_server.arg("bssid");
+    unsigned b[6] = {0};
+    if (ch > 0 && ch <= 14 &&
+        sscanf(bs.c_str(), "%x:%x:%x:%x:%x:%x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+      uint8_t bssid[6] = { (uint8_t)b[0], (uint8_t)b[1], (uint8_t)b[2],
+                           (uint8_t)b[3], (uint8_t)b[4], (uint8_t)b[5] };
+      s_prefs.putUChar("ch", (uint8_t)ch);
+      s_prefs.putBytes("bssid", bssid, 6);
+      s_prefs.putString("ssid_seen", ssid);
+      primed = true;
+      Serial.printf("[WiFi] user-pinned ch=%d bssid=%s\n", ch, bs.c_str());
+    }
+  }
+  if (!primed) {
+    // No specific AP picked - clear cache so boot does a fresh scan.
+    s_prefs.remove("ch");
+    s_prefs.remove("bssid");
+    s_prefs.remove("ssid_seen");
+  }
   s_server.send(200, "application/json", "{\"ok\":true}");
   delay(500); ESP.restart();
 }
@@ -921,70 +974,99 @@ static bool tryStation(const String& ssid, const String& pass) {
   delay(100);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);            // disable PS - common cause of HS timeouts
-  int    bestRssi = -1000, channel = 0;
-  uint8_t bssid[6] = {0};
-  scanForSsid(ssid, bestRssi, bssid, channel);
-  bool havePin = (channel > 0);
-#ifdef WIFI_DEFAULT_CHANNEL
-  // Force the configured channel even when the scan missed the AP (hidden
-  // SSID, congested band, etc.). We still honour the BSSID if we got one,
-  // but override the channel with the user-supplied value.
-  if (ssid == WIFI_DEFAULT_SSID && WIFI_DEFAULT_CHANNEL > 0) {
-    channel = WIFI_DEFAULT_CHANNEL;
-    Serial.printf("[WiFi] forcing channel %d for '%s'\n", channel, ssid.c_str());
-  }
-#endif
-  if (havePin) {
-    Serial.printf("[WiFi] pinning to BSSID %02X:%02X:%02X:%02X:%02X:%02X ch=%d (rssi=%d)\n",
-                  bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel, bestRssi);
-  }
   // Accept WPA-PSK as the lowest acceptable auth so a WPA2/WPA3-mixed AP can
   // negotiate down to WPA2-PSK (classic ESP32 has no WPA3 supplicant).
   WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
   WiFi.setAutoReconnect(true);
-  // Build the wifi_config_t ourselves so we can disable PMF. arduino-esp32
-  // 2.0.7+ enables pmf_cfg.capable by default, which some routers refuse the
-  // 4-way handshake with (reason 204 HANDSHAKE_TIMEOUT). 2.0.6 had it off and
-  // worked here, so force it off explicitly.
-  wifi_config_t wcfg = {};
-  strncpy((char*)wcfg.sta.ssid,     ssid.c_str(), sizeof(wcfg.sta.ssid) - 1);
-  strncpy((char*)wcfg.sta.password, pass.c_str(), sizeof(wcfg.sta.password) - 1);
-  wcfg.sta.pmf_cfg.capable  = false;
-  wcfg.sta.pmf_cfg.required = false;
-  wcfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
-  if (havePin) {
-    wcfg.sta.channel    = channel;
-    memcpy(wcfg.sta.bssid, bssid, 6);
-    wcfg.sta.bssid_set  = 1;
-  }
-#ifdef WIFI_DEFAULT_CHANNEL
-  else if (ssid == WIFI_DEFAULT_SSID && WIFI_DEFAULT_CHANNEL > 0) {
-    // Channel hint without BSSID lock: the supplicant will still probe only
-    // this channel, which lets us connect to a hidden AP.
-    wcfg.sta.channel   = WIFI_DEFAULT_CHANNEL;
-    wcfg.sta.bssid_set = 0;
-  }
-#endif
-  esp_wifi_set_config(WIFI_IF_STA, &wcfg);
-  esp_wifi_start();
-  esp_wifi_connect();
-  uint32_t t0 = millis();
-  wl_status_t last = WL_IDLE_STATUS;
-  while (millis() - t0 < 15000) {
-    wl_status_t s = WiFi.status();
-    if (s != last) { Serial.printf("[WiFi] status=%d\n", (int)s); last = s; }
-    if (s == WL_CONNECTED) {
+
+  // ---- Fast-path: try the cached channel + BSSID from NVS first ----------
+  // After a successful connect we persist the AP's channel and BSSID. On the
+  // next boot we skip the ~2 s active scan entirely and go straight to that
+  // (ssid, channel, bssid) tuple. If the AP has moved, this attempt fails
+  // within a couple of seconds and we fall through to the scan path below.
+  uint8_t cachedBssid[6] = {0};
+  uint8_t cachedCh = (uint8_t)s_prefs.getUChar("ch", 0);
+  size_t  bsLen    = s_prefs.getBytes("bssid", cachedBssid, 6);
+  bool    haveCache = (cachedCh > 0 && bsLen == 6);
+  String  cachedSsid = s_prefs.getString("ssid_seen", "");
+  if (haveCache && cachedSsid != ssid) haveCache = false; // cache is for a different SSID
+
+  auto attempt = [&](uint8_t ch, const uint8_t* bssid, uint32_t timeoutMs) -> bool {
+    wifi_config_t wcfg = {};
+    strncpy((char*)wcfg.sta.ssid,     ssid.c_str(), sizeof(wcfg.sta.ssid) - 1);
+    strncpy((char*)wcfg.sta.password, pass.c_str(), sizeof(wcfg.sta.password) - 1);
+    // arduino-esp32 2.0.7+ enables pmf_cfg.capable by default, which some
+    // routers refuse the 4-way handshake with (reason 204 HANDSHAKE_TIMEOUT).
+    wcfg.sta.pmf_cfg.capable  = false;
+    wcfg.sta.pmf_cfg.required = false;
+    wcfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+    if (ch > 0) {
+      wcfg.sta.channel = ch;
+      if (bssid) {
+        memcpy(wcfg.sta.bssid, bssid, 6);
+        wcfg.sta.bssid_set = 1;
+      }
+    }
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    esp_wifi_start();
+    esp_wifi_connect();
+    uint32_t t0 = millis();
+    wl_status_t last = WL_IDLE_STATUS;
+    while (millis() - t0 < timeoutMs) {
+      wl_status_t s = WiFi.status();
+      if (s != last) { Serial.printf("[WiFi] status=%d\n", (int)s); last = s; }
+      if (s == WL_CONNECTED) return true;
+      if (s == WL_NO_SSID_AVAIL || s == WL_CONNECT_FAILED) {
+        Serial.println(F("[WiFi] giving up early (no SSID / auth fail)"));
+        break;
+      }
+      delay(250);
+    }
+    return false;
+  };
+
+  auto saveCache = [&]() {
+    uint8_t* b = WiFi.BSSID();
+    if (!b) return;
+    s_prefs.putUChar("ch", (uint8_t)WiFi.channel());
+    s_prefs.putBytes("bssid", b, 6);
+    s_prefs.putString("ssid_seen", ssid);
+    Serial.printf("[WiFi] cached ch=%d bssid=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                  WiFi.channel(), b[0],b[1],b[2],b[3],b[4],b[5]);
+  };
+
+  if (haveCache) {
+    Serial.printf("[WiFi] fast-connect: ch=%d bssid=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                  cachedCh, cachedBssid[0], cachedBssid[1], cachedBssid[2],
+                  cachedBssid[3], cachedBssid[4], cachedBssid[5]);
+    if (attempt(cachedCh, cachedBssid, 6000)) {
       Serial.print(F("[WiFi] STA IP: ")); Serial.println(WiFi.localIP());
       Serial.printf("[WiFi] RSSI: %d dBm, channel: %d\n", WiFi.RSSI(), WiFi.channel());
+      saveCache();
       return true;
     }
-    if (s == WL_NO_SSID_AVAIL || s == WL_CONNECT_FAILED) {
-      // No point retrying for the full 15 s if the AP is plainly not there
-      // or the password is wrong.
-      Serial.println(F("[WiFi] giving up early (no SSID / auth fail)"));
-      break;
-    }
-    delay(250);
+    Serial.println(F("[WiFi] fast-connect failed, falling back to scan"));
+    WiFi.disconnect(true, false);
+    // Invalidate stale cache so we don't keep retrying it next boot.
+    s_prefs.remove("ch");
+    s_prefs.remove("bssid");
+    s_prefs.remove("ssid_seen");
+  }
+
+  // ---- Slow path: scan, pin to strongest BSSID, then connect -------------
+  int    bestRssi = -1000, channel = 0;
+  uint8_t bssid[6] = {0};
+  scanForSsid(ssid, bestRssi, bssid, channel);
+  bool havePin = (channel > 0);
+  if (havePin) {
+    Serial.printf("[WiFi] pinning to BSSID %02X:%02X:%02X:%02X:%02X:%02X ch=%d (rssi=%d)\n",
+                  bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel, bestRssi);
+  }
+  if (attempt(havePin ? (uint8_t)channel : 0, havePin ? bssid : nullptr, 15000)) {
+    Serial.print(F("[WiFi] STA IP: ")); Serial.println(WiFi.localIP());
+    Serial.printf("[WiFi] RSSI: %d dBm, channel: %d\n", WiFi.RSSI(), WiFi.channel());
+    saveCache();
+    return true;
   }
   Serial.printf("[WiFi] STA connect failed, final status=%d\n", (int)WiFi.status());
   WiFi.disconnect(true, true);
@@ -993,7 +1075,30 @@ static bool tryStation(const String& ssid, const String& pass) {
 
 static void startAccessPoint() {
   WiFi.mode(WIFI_AP);
+  // Force FCC regulatory domain so the radio uses the FCC power table (up to
+  // 20 dBm on 2.4 GHz). Some IDF builds default to a more restrictive domain
+  // ("01" world-safe) that caps TX at ~15 dBm. Must be called AFTER WiFi mode
+  // selection but BEFORE softAP() / connect, otherwise the cap from the old
+  // domain stays in effect for the active interface.
+  wifi_country_t country = {
+    .cc = "US",
+    .schan = 1,
+    .nchan = 11,
+    .max_tx_power = 84,           // 84 * 0.25 dBm = 21 dBm
+    .policy = WIFI_COUNTRY_POLICY_MANUAL,
+  };
+  esp_wifi_set_country(&country);
+  // Raise the per-interface TX cap before bringing up the AP. Using the raw
+  // IDF call (in 0.25 dBm units) rather than WiFi.setTxPower() lets us ask
+  // for 21 dBm; the chip will clamp internally to whatever its phy_init blob
+  // / calibration supports (usually 19.5 dBm on ESP32-D0WD).
+  esp_wifi_set_max_tx_power(84);
   WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS, WIFI_AP_CHAN);
+  // softAP() may have re-applied a default; re-assert max power.
+  esp_wifi_set_max_tx_power(84);
+  int8_t txp = 0;
+  esp_wifi_get_max_tx_power(&txp);
+  Serial.printf("[WiFi] AP up, TX power = %.2f dBm\n", txp * 0.25f);
   Serial.print(F("[WiFi] AP IP: ")); Serial.println(WiFi.softAPIP());
   s_dns.setErrorReplyCode(DNSReplyCode::NoError);
   s_dns.start(53, "*", WiFi.softAPIP());
@@ -1007,24 +1112,8 @@ void webui_begin() {
 
   String ssid = s_prefs.getString("ssid", "");
   String pass = s_prefs.getString("pass", "");
-  const char* src = "NVS";
-#ifdef WIFI_FORCE_DEFAULTS
-  ssid = WIFI_DEFAULT_SSID;
-  pass = WIFI_DEFAULT_PASS;
-  src  = "config.h (forced)";
-#else
-  // Fall back to compile-time defaults from config.h if NVS is empty.
-  if (!ssid.length() && sizeof(WIFI_DEFAULT_SSID) > 1) {
-    ssid = WIFI_DEFAULT_SSID;
-    pass = WIFI_DEFAULT_PASS;
-    src  = "config.h default";
-  }
-#endif
-  Serial.printf("[WiFi] credentials source: %s, ssid='%s' (len=%u), pass len=%u\n",
-                src, ssid.c_str(), (unsigned)ssid.length(), (unsigned)pass.length());
-#ifdef WIFI_FORCE_DEFAULTS
-  Serial.printf("[WiFi] pass='%s'\n", pass.c_str());
-#endif
+  Serial.printf("[WiFi] credentials from NVS, ssid='%s' (len=%u), pass len=%u\n",
+                ssid.c_str(), (unsigned)ssid.length(), (unsigned)pass.length());
   bool sta = false;
   if (ssid.length()) sta = tryStation(ssid, pass);
   if (!sta) startAccessPoint(); else s_apMode = false;

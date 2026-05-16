@@ -19,7 +19,7 @@ foreach ($d in $ghDirs) {
     }
 }
 
-$Env  = "lolin_s2_mini"
+$Env  = "mhetesp32minikit"
 $Bin  = ".pio\build\$Env\firmware.bin"
 
 # 1. Commit any pending changes
