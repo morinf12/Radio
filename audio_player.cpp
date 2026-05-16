@@ -48,11 +48,10 @@ void audio_begin() {
 
   s_audio.setPinout(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
   s_audio.setVolume(s_volume);
-  // 256 KB PSRAM ring buffer (~16 s @128 kbps). 1 MB was wasteful and made
-  // every fill/drain pay the slow SPI-PSRAM cost over a much larger working
-  // set; 256 KB keeps the hot region small enough to stay friendly to the
-  // PSRAM cache while still absorbing Wi-Fi jitter.
-  s_audio.setBufsize(-1, 256 * 1024);
+  // 64 KB ring buffer in INTERNAL RAM (this board has no PSRAM). ~4 s at
+  // 128 kbps - enough to absorb Wi-Fi jitter while leaving plenty of RAM
+  // for decoders, WiFi/lwIP and the rest of the app.
+  s_audio.setBufsize(64 * 1024, 0);
 
   s_audioMux = xSemaphoreCreateMutex();
   // Priority 2 is higher than the Arduino loopTask (priority 1) so the

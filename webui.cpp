@@ -967,12 +967,59 @@ static void scanForSsid(const String& ssid, int& bestRssi, uint8_t bssid[6], int
   WiFi.scanDelete();
 }
 
+// Last raw 802.11 disconnect reason reported by the IDF. Useful to diagnose
+// auth/4-way-handshake failures (e.g. repeater rejecting us). See
+// esp_wifi_types.h wifi_err_reason_t for the code list.
+static volatile uint8_t s_lastDisconnectReason = 0;
+static const char* wifiReasonStr(uint8_t r) {
+  switch (r) {
+    case 1:   return "UNSPECIFIED";
+    case 2:   return "AUTH_EXPIRE";
+    case 3:   return "AUTH_LEAVE";
+    case 4:   return "ASSOC_EXPIRE";
+    case 5:   return "ASSOC_TOOMANY";
+    case 6:   return "NOT_AUTHED";
+    case 7:   return "NOT_ASSOCED";
+    case 8:   return "ASSOC_LEAVE";
+    case 9:   return "ASSOC_NOT_AUTHED";
+    case 15:  return "4WAY_HANDSHAKE_TIMEOUT";
+    case 16:  return "GROUP_KEY_UPDATE_TIMEOUT";
+    case 17:  return "IE_IN_4WAY_DIFFERS";
+    case 18:  return "GROUP_CIPHER_INVALID";
+    case 19:  return "PAIRWISE_CIPHER_INVALID";
+    case 20:  return "AKMP_INVALID";
+    case 23:  return "IEEE_802_1X_AUTH_FAILED";
+    case 200: return "BEACON_TIMEOUT";
+    case 201: return "NO_AP_FOUND";
+    case 202: return "AUTH_FAIL";
+    case 203: return "ASSOC_FAIL";
+    case 204: return "HANDSHAKE_TIMEOUT";
+    case 205: return "CONNECTION_FAIL";
+    case 206: return "AP_TSF_RESET";
+    case 207: return "ROAMING";
+    default:  return "?";
+  }
+}
+
 static bool tryStation(const String& ssid, const String& pass) {
   Serial.printf("[WiFi] STA -> %s\n", ssid.c_str());
   WiFi.persistent(false);          // do not write creds to flash behind our back
   WiFi.mode(WIFI_OFF);             // clear any prior AP/STA state
   delay(100);
   WiFi.mode(WIFI_STA);
+
+  // Register a one-shot disconnect-reason logger so we can see WHY association
+  // or 4-way handshake fails (esp. against repeaters with mixed WPA2/WPA3).
+  static bool s_evtRegistered = false;
+  if (!s_evtRegistered) {
+    s_evtRegistered = true;
+    WiFi.onEvent([](WiFiEvent_t e, WiFiEventInfo_t info) {
+      uint8_t r = info.wifi_sta_disconnected.reason;
+      s_lastDisconnectReason = r;
+      Serial.printf("[WiFi] disconnect reason=%u (%s)\n", r, wifiReasonStr(r));
+    }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  }
+  s_lastDisconnectReason = 0;
   WiFi.setSleep(false);            // disable PS - common cause of HS timeouts
   // Accept WPA-PSK as the lowest acceptable auth so a WPA2/WPA3-mixed AP can
   // negotiate down to WPA2-PSK (classic ESP32 has no WPA3 supplicant).
@@ -1068,7 +1115,9 @@ static bool tryStation(const String& ssid, const String& pass) {
     saveCache();
     return true;
   }
-  Serial.printf("[WiFi] STA connect failed, final status=%d\n", (int)WiFi.status());
+  Serial.printf("[WiFi] STA connect failed, final status=%d, last reason=%u (%s)\n",
+                (int)WiFi.status(), s_lastDisconnectReason,
+                wifiReasonStr(s_lastDisconnectReason));
   WiFi.disconnect(true, true);
   return false;
 }
