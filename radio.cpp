@@ -1,11 +1,12 @@
 // =============================================================================
-//  ESP32-S2 Internet Radio - main entry point
-//  Hardware: ESP32-S2 + ST7789V3 (240x280) + PCM5102 I2S DAC
+//  ESP32 Internet Radio - main entry point
+//  Hardware: ESP32 (Wemos MiniKit) + ST7789V3 (240x280) + PCM5102 I2S DAC
 //            + KY-040 rotary encoder + 2 push buttons (prev/next)
 // =============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <esp_log.h>
 
 #include "config.h"
 #include "display.h"
@@ -42,6 +43,11 @@ void setup() {
   delay(200);
   Serial.println(F("\n[Radio] boot"));
 
+  // Silence the harmless "nvs_open failed: NOT_FOUND" error logged by
+  // Preferences when opening a non-existent namespace read-only (happens
+  // on a freshly-erased chip until the first write creates the namespace).
+  esp_log_level_set("nvs", ESP_LOG_NONE);
+
   // Restore display backlight
   uint8_t bl = DEFAULT_BACKLIGHT;
   {
@@ -68,12 +74,17 @@ void setup() {
 
   controls_begin();
   stations_begin();
-  audio_begin();
-  display_setVolume(audio_getVolume(), MAX_VOLUME, false);
 
-  // Wi-Fi + web server (also handles captive-portal AP fallback)
+  // Wi-Fi + web server (also handles captive-portal AP fallback).
+  // IMPORTANT: bring Wi-Fi up BEFORE starting the audio task. The audio task
+  // runs at priority 2 (higher than the Arduino loopTask) and its tight
+  // s_audio.loop() spin competes with the Wi-Fi connect path, causing the
+  // 15 s STA timeout to expire and the radio to fall back to AP mode.
   webui_begin();
   display_setWifi(!webui_isApMode(), webui_currentSsidOrIp());
+
+  audio_begin();
+  display_setVolume(audio_getVolume(), MAX_VOLUME, false);
 
   // Show IP on the splash screen for a couple of seconds before switching to
   // the playback UI.

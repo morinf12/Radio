@@ -5,6 +5,7 @@
 #include "display.h"
 #include "controls.h"
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -876,20 +877,116 @@ static void hOtaUpload() {
 //  Setup
 // ============================================================================
 
+static const char* authModeName(int a) {
+  switch (a) {
+    case WIFI_AUTH_OPEN:            return "OPEN";
+    case WIFI_AUTH_WEP:             return "WEP";
+    case WIFI_AUTH_WPA_PSK:         return "WPA-PSK";
+    case WIFI_AUTH_WPA2_PSK:        return "WPA2-PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2-PSK";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-ENT";
+    case WIFI_AUTH_WPA3_PSK:        return "WPA3-PSK";
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3-PSK";
+    default:                        return "?";
+  }
+}
+
+static void scanForSsid(const String& ssid, int& bestRssi, uint8_t bssid[6], int& channel) {
+  bestRssi = -1000; channel = 0; memset(bssid, 0, 6);
+  Serial.println(F("[WiFi] scanning..."));
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks(false, true);   // sync, show hidden
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == ssid) {
+      Serial.printf("[WiFi] FOUND '%s' rssi=%d ch=%d auth=%s\n",
+                    WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i),
+                    authModeName(WiFi.encryptionType(i)));
+      found = true;
+      if (WiFi.RSSI(i) > bestRssi) {
+        bestRssi = WiFi.RSSI(i);
+        channel  = WiFi.channel(i);
+        memcpy(bssid, WiFi.BSSID(i), 6);
+      }
+    }
+  }
+  if (!found) Serial.printf("[WiFi] SSID '%s' NOT seen (%d nets scanned)\n", ssid.c_str(), n);
+  WiFi.scanDelete();
+}
+
 static bool tryStation(const String& ssid, const String& pass) {
   Serial.printf("[WiFi] STA -> %s\n", ssid.c_str());
+  WiFi.persistent(false);          // do not write creds to flash behind our back
+  WiFi.mode(WIFI_OFF);             // clear any prior AP/STA state
+  delay(100);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);            // disable PS - common cause of HS timeouts
+  int    bestRssi = -1000, channel = 0;
+  uint8_t bssid[6] = {0};
+  scanForSsid(ssid, bestRssi, bssid, channel);
+  bool havePin = (channel > 0);
+#ifdef WIFI_DEFAULT_CHANNEL
+  // Force the configured channel even when the scan missed the AP (hidden
+  // SSID, congested band, etc.). We still honour the BSSID if we got one,
+  // but override the channel with the user-supplied value.
+  if (ssid == WIFI_DEFAULT_SSID && WIFI_DEFAULT_CHANNEL > 0) {
+    channel = WIFI_DEFAULT_CHANNEL;
+    Serial.printf("[WiFi] forcing channel %d for '%s'\n", channel, ssid.c_str());
+  }
+#endif
+  if (havePin) {
+    Serial.printf("[WiFi] pinning to BSSID %02X:%02X:%02X:%02X:%02X:%02X ch=%d (rssi=%d)\n",
+                  bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel, bestRssi);
+  }
+  // Accept WPA-PSK as the lowest acceptable auth so a WPA2/WPA3-mixed AP can
+  // negotiate down to WPA2-PSK (classic ESP32 has no WPA3 supplicant).
+  WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid.c_str(), pass.length() ? pass.c_str() : (const char*)nullptr);
+  // Build the wifi_config_t ourselves so we can disable PMF. arduino-esp32
+  // 2.0.7+ enables pmf_cfg.capable by default, which some routers refuse the
+  // 4-way handshake with (reason 204 HANDSHAKE_TIMEOUT). 2.0.6 had it off and
+  // worked here, so force it off explicitly.
+  wifi_config_t wcfg = {};
+  strncpy((char*)wcfg.sta.ssid,     ssid.c_str(), sizeof(wcfg.sta.ssid) - 1);
+  strncpy((char*)wcfg.sta.password, pass.c_str(), sizeof(wcfg.sta.password) - 1);
+  wcfg.sta.pmf_cfg.capable  = false;
+  wcfg.sta.pmf_cfg.required = false;
+  wcfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+  if (havePin) {
+    wcfg.sta.channel    = channel;
+    memcpy(wcfg.sta.bssid, bssid, 6);
+    wcfg.sta.bssid_set  = 1;
+  }
+#ifdef WIFI_DEFAULT_CHANNEL
+  else if (ssid == WIFI_DEFAULT_SSID && WIFI_DEFAULT_CHANNEL > 0) {
+    // Channel hint without BSSID lock: the supplicant will still probe only
+    // this channel, which lets us connect to a hidden AP.
+    wcfg.sta.channel   = WIFI_DEFAULT_CHANNEL;
+    wcfg.sta.bssid_set = 0;
+  }
+#endif
+  esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+  esp_wifi_start();
+  esp_wifi_connect();
   uint32_t t0 = millis();
+  wl_status_t last = WL_IDLE_STATUS;
   while (millis() - t0 < 15000) {
-    if (WiFi.status() == WL_CONNECTED) {
+    wl_status_t s = WiFi.status();
+    if (s != last) { Serial.printf("[WiFi] status=%d\n", (int)s); last = s; }
+    if (s == WL_CONNECTED) {
       Serial.print(F("[WiFi] STA IP: ")); Serial.println(WiFi.localIP());
+      Serial.printf("[WiFi] RSSI: %d dBm, channel: %d\n", WiFi.RSSI(), WiFi.channel());
       return true;
+    }
+    if (s == WL_NO_SSID_AVAIL || s == WL_CONNECT_FAILED) {
+      // No point retrying for the full 15 s if the AP is plainly not there
+      // or the password is wrong.
+      Serial.println(F("[WiFi] giving up early (no SSID / auth fail)"));
+      break;
     }
     delay(250);
   }
-  Serial.println(F("[WiFi] STA connect failed"));
+  Serial.printf("[WiFi] STA connect failed, final status=%d\n", (int)WiFi.status());
   WiFi.disconnect(true, true);
   return false;
 }
@@ -910,6 +1007,24 @@ void webui_begin() {
 
   String ssid = s_prefs.getString("ssid", "");
   String pass = s_prefs.getString("pass", "");
+  const char* src = "NVS";
+#ifdef WIFI_FORCE_DEFAULTS
+  ssid = WIFI_DEFAULT_SSID;
+  pass = WIFI_DEFAULT_PASS;
+  src  = "config.h (forced)";
+#else
+  // Fall back to compile-time defaults from config.h if NVS is empty.
+  if (!ssid.length() && sizeof(WIFI_DEFAULT_SSID) > 1) {
+    ssid = WIFI_DEFAULT_SSID;
+    pass = WIFI_DEFAULT_PASS;
+    src  = "config.h default";
+  }
+#endif
+  Serial.printf("[WiFi] credentials source: %s, ssid='%s' (len=%u), pass len=%u\n",
+                src, ssid.c_str(), (unsigned)ssid.length(), (unsigned)pass.length());
+#ifdef WIFI_FORCE_DEFAULTS
+  Serial.printf("[WiFi] pass='%s'\n", pass.c_str());
+#endif
   bool sta = false;
   if (ssid.length()) sta = tryStation(ssid, pass);
   if (!sta) startAccessPoint(); else s_apMode = false;

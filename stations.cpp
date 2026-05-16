@@ -11,8 +11,8 @@ static int     s_cur   = 0;
 //   98.5  -> 98,5 FM Montréal (CHMP-FM) - parlé / talk
 // Stream URLs sourced from public iHeart / Cogeco radio listings.
 static const Station DEFAULTS[] PROGMEM = {
-  { "98,5 FM Montreal", "https://stream.iheart.com/cogeco-985fm" },
-  { "Planete 97,7",     "https://stream.iheart.com/cogeco-cklx" },
+  { "98,5", "http://playerservices.streamtheworld.com/api/livestream-redirect/CHMPFM.mp3" },
+  { "97,7",     "http://playerservices.streamtheworld.com/api/livestream-redirect/CHOMFM.mp3" },
 };
 static const int DEFAULT_COUNT = sizeof(DEFAULTS) / sizeof(DEFAULTS[0]);
 

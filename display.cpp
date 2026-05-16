@@ -1,5 +1,6 @@
 #include "display.h"
 #include "config.h"
+#include "audio_player.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
@@ -9,9 +10,11 @@
 #define FW_VERSION "dev"
 #endif
 
-// ESP32-S2 has FSPI as the user SPI bus. Bind the TFT to it explicitly so we
-// can pick GPIO 11/12 for MOSI/SCLK (same wiring as the horloge project).
-static SPIClass s_spi(FSPI);
+// On classic ESP32, FSPI is SPI1 - which is the on-chip flash bus. Binding
+// the TFT to it deadlocks the CPU on the first SPI transaction. Use HSPI
+// (SPI2) instead, which is the standard user SPI on this part. On S2/S3
+// FSPI happens to be SPI2 as well, so HSPI is a safe choice on both.
+static SPIClass s_spi(HSPI);
 static Adafruit_ST7789 s_tft(&s_spi, TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN);
 
 // ---------------- Off-screen framebuffer (PSRAM) -----------------------------
@@ -27,19 +30,26 @@ public:
   PSCanvas16(uint16_t w, uint16_t h)
     : GFXcanvas16(w, h, /*allocate_buffer=*/false) {
     size_t bytes = (size_t)w * (size_t)h * 2;
+    // Prefer PSRAM; only fall back to internal RAM if there's plenty of it
+    // free (this board is a no-PSRAM ESP32 with ~290 KB heap at boot, and a
+    // 134 KB canvas would starve WiFi+audio). Refuse the allocation otherwise
+    // and let display_begin() switch to direct-to-panel rendering.
     buffer = (uint16_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
     if (!buffer) {
-      // Fallback to internal RAM if PSRAM allocation fails (e.g. when run on
-      // a board without PSRAM). Drawing still works.
-      buffer = (uint16_t*)malloc(bytes);
+      size_t freeRam = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+      if (freeRam > bytes + 80 * 1024) {
+        buffer = (uint16_t*)malloc(bytes);
+      }
     }
     if (buffer) memset(buffer, 0, bytes);
     buffer_owned = false;   // long-lived, never destroyed
   }
+  bool ok() const { return buffer != nullptr; }
 };
 
 static PSCanvas16* s_canvas = nullptr;
-#define g (*s_canvas)            // drawing target: canvas in PSRAM
+static Adafruit_GFX* s_gfx = nullptr;     // points at canvas if allocated, else &s_tft
+#define g (*s_gfx)               // drawing target
 
 static String  s_station = "";
 static int     s_idx = 0, s_total = 0;
@@ -54,6 +64,7 @@ static uint8_t s_backlight = DEFAULT_BACKLIGHT;
 static bool    s_dirty = true;
 static int     s_titleScroll = 0;
 static uint32_t s_lastScroll = 0;
+static bool    s_titleOverflows = false;  // true when title is wider than screen (needs scrolling)
 
 #define TITLE_AREA_Y       136
 #define TITLE_AREA_H        28
@@ -67,7 +78,9 @@ static uint32_t s_lastScroll = 0;
 #define SAFE_H              (TFT_HEIGHT - 2 * MARGIN)
 
 static void applyBacklight() {
-#if defined(TFT_BL_PIN) && TFT_BL_PIN >= 0
+#ifdef DISPLAY_DISABLED
+  return;
+#elif defined(TFT_BL_PIN) && TFT_BL_PIN >= 0
   // Simple PWM via ledc (channel 0).
   static bool s_init = false;
   if (!s_init) {
@@ -82,7 +95,8 @@ static void applyBacklight() {
 
 // Push the PSRAM canvas to the panel as a single bitmap blit. Adafruit_SPITFT
 // turns this into one setAddrWindow() + a streamed writePixels(), so there is
-// no visible "drawing in progress" flicker on the screen.
+// no visible "drawing in progress" flicker on the screen. When no canvas is
+// available we drew directly to the panel and this is a no-op.
 static void flush() {
   if (!s_canvas || !s_canvas->getBuffer()) return;
   s_tft.startWrite();
@@ -92,6 +106,13 @@ static void flush() {
 }
 
 void display_begin() {
+#ifdef DISPLAY_DISABLED
+  // TFT not wired - skip all SPI / panel init. The rest of the firmware
+  // (Wi-Fi, audio, web UI, buttons) still uses the display_setXxx() setters
+  // to update internal state, but no pixels are pushed anywhere.
+  Serial.println(F("[Display] DISABLED (DISPLAY_DISABLED set in config.h)"));
+  return;
+#endif
   // Bind FSPI to the actual TFT wiring before initialising the panel.
   s_spi.begin(TFT_SCLK_PIN, -1, TFT_MOSI_PIN, TFT_CS_PIN);
 
@@ -114,6 +135,15 @@ void display_begin() {
   // it is laid out in the same orientation the panel uses after setRotation(),
   // so its (0,0) maps directly to the TFT's (0,0).
   if (!s_canvas) s_canvas = new PSCanvas16(TFT_WIDTH, TFT_HEIGHT);
+  if (s_canvas && s_canvas->ok()) {
+    s_gfx = s_canvas;
+    Serial.println(F("[Display] using off-screen canvas"));
+  } else {
+    // No PSRAM and not enough internal RAM for a full-screen canvas. Draw
+    // directly to the panel - a touch of flicker, but it boots.
+    s_gfx = &s_tft;
+    Serial.println(F("[Display] no canvas - drawing direct to panel"));
+  }
   g.fillScreen(COL_BG);
 
   applyBacklight();
@@ -122,6 +152,7 @@ void display_begin() {
 
 // ---------------- Splash screen ---------------------------------------------
 void display_showBoot(const char* hostname) {
+  if (!s_canvas) return;   // DISPLAY_DISABLED or PSRAM alloc failed
   g.fillScreen(COL_BG);
   g.setTextWrap(false);
 
@@ -157,6 +188,7 @@ void display_showBoot(const char* hostname) {
 
 void display_showIP(const char* ip) {
   if (!ip || !*ip) return;
+  if (!s_canvas) return;   // DISPLAY_DISABLED or PSRAM alloc failed
   g.fillRect(SAFE_X, 140, SAFE_W, 30, COL_BG);
   g.setTextColor(COL_OK);
   g.setTextSize(2);
@@ -257,10 +289,12 @@ static void drawTitleArea() {
   g.getTextBounds(t, 0, 0, &bx, &by, &bw, &bh);
   int x;
   if ((int)bw <= SAFE_W) {
+    s_titleOverflows = false;
     x = SAFE_X + (SAFE_W - (int16_t)bw) / 2;
     g.setCursor(x, TITLE_AREA_Y + 8);
     g.print(t);
   } else {
+    s_titleOverflows = true;
     int total = (int)bw + 30;
     int off = s_titleScroll % total;
     g.setCursor(SAFE_X - off, TITLE_AREA_Y + 8);
@@ -292,13 +326,20 @@ static void drawVolume() {
 }
 
 void display_loop() {
+#ifdef DISPLAY_DISABLED
+  return;
+#endif
+  // While audio is actively streaming, freeze the TFT entirely. A full-frame
+  // blit takes ~27 ms over SPI at 40 MHz on the single-core S2 and starves
+  // the I2S DMA feeder, causing audible drop-outs. Any pending change is
+  // remembered in s_dirty and will be flushed the next time playback stops.
+  if (audio_isPlaying()) return;
+
   uint32_t now = millis();
-  // Scrolling title (50 ms). The full frame is recomposed and pushed in one
-  // go below, so the title-scroll path also needs a flush.
   bool needFlush = false;
-  if (s_title.length() && now - s_lastScroll >= 50) {
+  if (s_titleOverflows && s_title.length() && now - s_lastScroll >= 100) {
     s_lastScroll = now;
-    s_titleScroll += 2;
+    s_titleScroll += 4;
     drawTitleArea();
     needFlush = true;
   }
